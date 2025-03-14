@@ -71,10 +71,15 @@ class TradingBot:
         self.api_limiter = RateLimiter(calls_per_second=5)
         self.symbols = []
         self.message_queue = asyncio.Queue()
+        # Инициализируем exchange до setup_connections
+        self.exchange = ccxt.bybit({
+            'apiKey': API_KEY,
+            'secret': API_SECRET,
+            'enableRateLimit': True,
+        })
         self.setup_connections()
         logger.info("Бот запущен, начинается инициализация...")
 
-    
     def setup_connections(self):
         try:
             # Инициализация HTTP сессии
@@ -189,11 +194,19 @@ class TradingBot:
                 logger.error(f"Ошибка получения свечей {symbol}: {str(e)}")
                 return None
 
-    def get_orderbook_clusters(self, symbol, window=10):
+    def get_orderbook_clusters(self, symbol):
         try:
+            if not self.exchange:
+                logger.error(f"Exchange не инициализирован для {symbol}")
+                return []
+
             orderbook = self.exchange.fetch_order_book(symbol)
-            bids = orderbook['bids'][:window]
-            asks = orderbook['asks'][:window]
+            if not orderbook:
+                logger.error(f"Не удалось получить стакан для {symbol}")
+                return []
+
+            bids = orderbook['bids']
+            asks = orderbook['asks']
             
             total_volume = sum([amt for _, amt in bids + asks])
             if total_volume < MIN_VOLUME * 0.1:
@@ -206,7 +219,9 @@ class TradingBot:
                     continue
                 rounded_price = round(price, 1)
                 cluster_levels[rounded_price] += amount
-            return sorted(cluster_levels.items(), key=lambda x: x[1], reverse=True)[:3]
+            
+            sorted_clusters = sorted(cluster_levels.items(), key=lambda x: x[1], reverse=True)
+            return sorted_clusters[:5]  # Возвращаем топ-5 кластеров
             
         except Exception as e:
             logger.error(f"Ошибка анализа стакана {symbol}: {e}")
@@ -221,8 +236,8 @@ class TradingBot:
         atr = tr.rolling(window=period).mean().fillna(0)
         plus_dm = np.where(high - high.shift() > low.shift() - low, high - high.shift(), 0)
         minus_dm = np.where(low.shift() - low > high - high.shift(), low.shift() - low, 0)
-        plus_di = 100 * (pd.Series(plus_dm).rolling(window=period).mean().fillna(0) / atr)
-        minus_di = 100 * (pd.Series(minus_dm).rolling(window=period).mean().fillna(0) / atr)
+        plus_di = 100 * (pd.Series(plus_dm).rolling(window=period).mean().fillna(0) / atr
+        minus_di = 100 * (pd.Series(minus_dm).rolling(window=period).mean().fillna(0) / atr
         dx = (np.abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
         return dx.rolling(window=period).mean().fillna(0)
 
@@ -232,8 +247,8 @@ class TradingBot:
         atr = tr.rolling(window=period).mean()
         plus_dm = np.where(high - high.shift() > low.shift() - low, high - high.shift(), 0)
         minus_dm = np.where(low.shift() - low > high - high.shift(), low.shift() - low, 0)
-        plus_di = 100 * (pd.Series(plus_dm).rolling(window=period).mean() / atr)
-        minus_di = 100 * (pd.Series(minus_dm).rolling(window=period).mean() / atr)
+        plus_di = 100 * (pd.Series(plus_dm).rolling(window=period).mean() / atr
+        minus_di = 100 * (pd.Series(minus_dm).rolling(window=period).mean() / atr
         return plus_di.iloc[-1], minus_di.iloc[-1]
 
     def calculate_atr(self, data, period=ATR_PERIOD):
@@ -343,9 +358,14 @@ class TradingBot:
 
         except Exception as e:
             logger.error(f"Ошибка обработки WebSocket: {e}")
+
     def ws_message_handler(self, message):
         """Функция обратного вызова для сообщений WebSocket"""
-        asyncio.create_task(self.message_queue.put(message))       
+        try:
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(self.message_queue.put(message), loop)
+        except Exception as e:
+            logger.error(f"Ошибка в обработчике сообщений: {e}")
 
     async def ws_listener(self):
         while True:
@@ -384,54 +404,59 @@ class TradingBot:
             return False
 
     async def process_candle(self, symbol):
-        await self.api_limiter.wait()
-        df = await self.fetch_candles(symbol)
-        if df is None or len(df) < SMA_PERIOD:
-            return
+        try:
+            await self.api_limiter.wait()
+            df = await self.fetch_candles(symbol)
+            if df is None or len(df) < SMA_PERIOD:
+                return
 
-        last_ts = df['timestamp'].iloc[-1]
-        if symbol in self.last_candle_ts and self.last_candle_ts[symbol] == last_ts:
-            return
-        self.last_candle_ts[symbol] = last_ts
+            last_ts = df['timestamp'].iloc[-1]
+            if symbol in self.last_candle_ts and self.last_candle_ts[symbol] == last_ts:
+                return
+            self.last_candle_ts[symbol] = last_ts
 
-        trend = self.determine_trend(df)
-        atr_series = self.calculate_atr(df)
-        current_price = df['close'].iloc[-1]
+            trend = self.determine_trend(df)
+            if trend == "flat":
+                return
 
-        if trend == "flat":
-            return
+            orderbook_clusters = self.get_orderbook_clusters(symbol)
+            if not orderbook_clusters:
+                logger.warning(f"Пустой стакан для {symbol}, пропускаем")
+                return
 
-        balance = self.session.get_coins_balance(accountType="UNIFIED", coin="USDT")
-        usdt_balance = next((float(c["walletBalance"]) for c in balance["result"]["balance"] if c["coin"] == "USDT"), 0.0)
-        order_usdt = usdt_balance * ORDER_PERCENTAGE
+            atr_series = self.calculate_atr(df)
+            current_price = df['close'].iloc[-1]
 
-        best_support, best_resistance = self.get_historical_levels(df)
-        orderbook_clusters = self.get_orderbook_clusters(symbol)
+            balance = self.session.get_coins_balance(accountType="UNIFIED", coin="USDT")
+            usdt_balance = next((float(c["walletBalance"]) for c in balance["result"]["balance"] if c["coin"] == "USDT"), 0.0)
+            order_usdt = usdt_balance * ORDER_PERCENTAGE
 
-        key_level = None
-        side = "Buy" if trend == "uptrend" else "Sell"
-        key_level = self.find_matching_level(
-            best_support if trend == "uptrend" else best_resistance,
-            orderbook_clusters
-        )
+            best_support, best_resistance = self.get_historical_levels(df)
+            key_level = self.find_matching_level(
+                best_support if trend == "uptrend" else best_resistance,
+                orderbook_clusters
+            )
 
-        if key_level is None or abs(current_price - key_level) / key_level > 0.005:
-            return
+            if key_level is None or abs(current_price - key_level) / key_level > 0.005:
+                return
 
-        raw_qty = order_usdt / key_level
-        placed_qty = await self.execute_order(symbol, key_level, side, raw_qty)
-        
-        if placed_qty:
-            tp, sl = self.calculate_tp_sl(key_level, side, atr_series.iloc[-1])
-            self.open_positions[symbol] = {
-                "entry_price": key_level,
-                "order_size": placed_qty,
-                "side": side,
-                "tp": tp,
-                "sl": sl,
-                "averaging_count": 0
-            }
-            self.log_trade(symbol, "initial", key_level, placed_qty, side, 0, tp, sl)
+            raw_qty = order_usdt / key_level
+            placed_qty = await self.execute_order(symbol, key_level, "Buy" if trend == "uptrend" else "Sell", raw_qty)
+            
+            if placed_qty:
+                tp, sl = self.calculate_tp_sl(key_level, trend, atr_series.iloc[-1])
+                self.open_positions[symbol] = {
+                    "entry_price": key_level,
+                    "order_size": placed_qty,
+                    "side": "Buy" if trend == "uptrend" else "Sell",
+                    "tp": tp,
+                    "sl": sl,
+                    "averaging_count": 0
+                }
+                self.log_trade(symbol, "initial", key_level, placed_qty, "Buy" if trend == "uptrend" else "Sell", 0, tp, sl)
+
+        except Exception as e:
+            logger.error(f"Ошибка обработки свечи {symbol}: {e}")
 
     def get_historical_levels(self, df, period=50):
         recent_data = df[-period:]
@@ -453,29 +478,37 @@ class TradingBot:
             return entry_price - risk_factor * atr, entry_price + atr
 
     async def main_loop(self):
-        self.init_db()
-        if not self.fetch_symbols():
-            logger.error("Нет доступных торговых пар")
-            return
+        try:
+            self.init_db()
+            if not self.fetch_symbols():
+                logger.error("Нет доступных торговых пар")
+                return
 
-        tasks = [
-            asyncio.create_task(self.ws_listener()),
-            asyncio.create_task(self.keep_alive()),
-            asyncio.create_task(self.check_drawdown())
-        ]
+            tasks = [
+                asyncio.create_task(self.ws_listener()),
+                asyncio.create_task(self.keep_alive()),
+                asyncio.create_task(self.check_drawdown())
+            ]
 
-        while True:
-            for symbol in self.symbols:
-                await self.process_candle(symbol)
-            await asyncio.sleep(int(TIMEFRAME))
+            while True:
+                for symbol in self.symbols:
+                    await self.process_candle(symbol)
+                await asyncio.sleep(int(TIMEFRAME))
+
+        except Exception as e:
+            logger.error(f"Ошибка в основном цикле: {e}")
+            await self.shutdown()
+            raise
 
     async def shutdown(self):
         logger.info("Завершение работы...")
         try:
             for symbol in list(self.open_positions.keys()):
                 await self.close_position(symbol)
-            if self.ws.is_connected():
+            if hasattr(self, 'ws') and self.ws.is_connected():
                 await self.ws.close()
+            if self.exchange:
+                await self.exchange.close()
         except Exception as e:
             logger.error(f"Ошибка завершения: {e}")
 
