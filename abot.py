@@ -74,31 +74,44 @@ class TradingBot:
         self.setup_connections()
         logger.info("Бот запущен, начинается инициализация...")
 
+    
     def setup_connections(self):
         try:
+            # Инициализация HTTP сессии
             self.session = HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
             balance = self.session.get_coins_balance(accountType="UNIFIED", coin="USDT")
             usdt_balance = next((float(c["walletBalance"]) for c in balance["result"]["balance"] if c["coin"] == "USDT"), 0.0)
             logger.info(f"API Bybit работает, баланс USDT: {usdt_balance:.2f}")
 
+            # Получаем список символов перед настройкой WebSocket
+            if not self.fetch_symbols():
+                raise Exception("Не удалось получить список символов")
+
+            # Инициализация WebSocket
             self.ws = WebSocket(
                 testnet=False,
                 channel_type="linear",
                 api_key=API_KEY,
                 api_secret=API_SECRET
             )
-            
-            # Добавление обработчика сообщений
-            self.ws.kline_stream(
-                interval=TIMEFRAME,
-                callback=self.ws_message_handler
-            )
 
-            self.exchange = ccxt.bybit({
-                'apiKey': API_KEY,
-                'secret': API_SECRET,
-                'options': {'defaultType': 'future'}
-            })
+            # Подписываемся на поток свечей для каждого символа
+            success_subscriptions = []
+            for symbol in self.symbols:
+                try:
+                    self.ws.kline_stream(
+                        symbol=symbol,
+                        interval=TIMEFRAME,
+                        callback=self.ws_message_handler
+                    )
+                    success_subscriptions.append(symbol)
+                except Exception as e:
+                    logger.error(f"Ошибка подписки на {symbol}: {e}")
+
+            if not success_subscriptions:
+                raise Exception("Не удалось подписаться ни на один символ")
+
+            logger.info(f"Успешно подписались на {len(success_subscriptions)} символов")
 
         except Exception as e:
             logger.critical(f"Ошибка инициализации соединений: {e}")
