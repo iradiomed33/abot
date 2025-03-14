@@ -584,8 +584,6 @@ def fetch_symbols():
         logger.critical(f"Ошибка получения символов: {e}")
         return []
 
-
-
 async def main():
     init_db()
     symbols = fetch_symbols()
