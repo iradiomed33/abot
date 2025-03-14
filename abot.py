@@ -236,8 +236,8 @@ class TradingBot:
         atr = tr.rolling(window=period).mean().fillna(0)
         plus_dm = np.where(high - high.shift() > low.shift() - low, high - high.shift(), 0)
         minus_dm = np.where(low.shift() - low > high - high.shift(), low.shift() - low, 0)
-        plus_di = 100 * (pd.Series(plus_dm).rolling(window=period).mean().fillna(0) / atr
-        minus_di = 100 * (pd.Series(minus_dm).rolling(window=period).mean().fillna(0) / atr
+        plus_di = 100 * (pd.Series(plus_dm)).rolling(window=period).mean().fillna(0) / atr
+        minus_di = 100 * (pd.Series(minus_dm)).rolling(window=period).mean().fillna(0) / atr
         dx = (np.abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
         return dx.rolling(window=period).mean().fillna(0)
 
@@ -247,8 +247,8 @@ class TradingBot:
         atr = tr.rolling(window=period).mean()
         plus_dm = np.where(high - high.shift() > low.shift() - low, high - high.shift(), 0)
         minus_dm = np.where(low.shift() - low > high - high.shift(), low.shift() - low, 0)
-        plus_di = 100 * (pd.Series(plus_dm).rolling(window=period).mean() / atr
-        minus_di = 100 * (pd.Series(minus_dm).rolling(window=period).mean() / atr
+        plus_di = 100 * (pd.Series(plus_dm)).rolling(window=period).mean() / atr
+        minus_di = 100 * (pd.Series(minus_dm)).rolling(window=period).mean() / atr
         return plus_di.iloc[-1], minus_di.iloc[-1]
 
     def calculate_atr(self, data, period=ATR_PERIOD):
