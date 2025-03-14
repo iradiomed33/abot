@@ -70,6 +70,7 @@ class TradingBot:
         self.position_lock = asyncio.Lock()
         self.api_limiter = RateLimiter(calls_per_second=5)
         self.symbols = []
+        self.message_queue = asyncio.Queue()
         self.setup_connections()
         logger.info("Бот запущен, начинается инициализация...")
 
@@ -85,6 +86,12 @@ class TradingBot:
                 channel_type="linear",
                 api_key=API_KEY,
                 api_secret=API_SECRET
+            )
+            
+            # Добавление обработчика сообщений
+            self.ws.kline_stream(
+                interval=TIMEFRAME,
+                callback=self.ws_message_handler
             )
 
             self.exchange = ccxt.bybit({
@@ -323,6 +330,9 @@ class TradingBot:
 
         except Exception as e:
             logger.error(f"Ошибка обработки WebSocket: {e}")
+    def ws_message_handler(self, message):
+        """Функция обратного вызова для сообщений WebSocket"""
+        asyncio.create_task(self.message_queue.put(message))       
 
     async def ws_listener(self):
         while True:
@@ -331,7 +341,7 @@ class TradingBot:
                     await asyncio.sleep(1)
                     continue
 
-                message = await self.ws.recv()
+                message = await self.message_queue.get()
                 await self.handle_message(message)
 
             except WebSocketError as e:
