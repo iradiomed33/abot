@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 import requests
 import sqlite3
+import threading
 from collections import defaultdict
 from pybit.unified_trading import WebSocket, HTTP
 from dotenv import load_dotenv
@@ -71,7 +72,9 @@ class TradingBot:
         self.api_limiter = RateLimiter(calls_per_second=5)
         self.symbols = []
         self.message_queue = asyncio.Queue()
-        # Инициализируем exchange до setup_connections
+        self.loop = asyncio.get_event_loop()
+        self.ws_connected = False
+        
         self.exchange = ccxt.bybit({
             'apiKey': API_KEY,
             'secret': API_SECRET,
@@ -82,32 +85,41 @@ class TradingBot:
 
     def setup_connections(self):
         try:
-            # Инициализация HTTP сессии
             self.session = HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
             balance = self.session.get_coins_balance(accountType="UNIFIED", coin="USDT")
             usdt_balance = next((float(c["walletBalance"]) for c in balance["result"]["balance"] if c["coin"] == "USDT"), 0.0)
             logger.info(f"API Bybit работает, баланс USDT: {usdt_balance:.2f}")
 
-            # Получаем список символов перед настройкой WebSocket
             if not self.fetch_symbols():
                 raise Exception("Не удалось получить список символов")
 
-            # Инициализация WebSocket
+            self.setup_websocket()
+
+        except Exception as e:
+            logger.critical(f"Ошибка инициализации соединений: {e}")
+            raise
+
+    def setup_websocket(self):
+        try:
+            if self.ws and self.ws.is_connected():
+                self.ws.exit()
+                
             self.ws = WebSocket(
                 testnet=False,
                 channel_type="linear",
                 api_key=API_KEY,
-                api_secret=API_SECRET
+                api_secret=API_SECRET,
+                ping_interval=20,
+                ping_timeout=10
             )
 
-            # Подписываемся на поток свечей для каждого символа
             success_subscriptions = []
             for symbol in self.symbols:
                 try:
                     self.ws.kline_stream(
                         symbol=symbol,
                         interval=TIMEFRAME,
-                        callback=self.ws_message_handler
+                        callback=self._ws_message_handler
                     )
                     success_subscriptions.append(symbol)
                 except Exception as e:
@@ -116,10 +128,12 @@ class TradingBot:
             if not success_subscriptions:
                 raise Exception("Не удалось подписаться ни на один символ")
 
+            self.ws_connected = True
             logger.info(f"Успешно подписались на {len(success_subscriptions)} символов")
 
         except Exception as e:
-            logger.critical(f"Ошибка инициализации соединений: {e}")
+            logger.error(f"Ошибка настройки WebSocket: {e}")
+            self.ws_connected = False
             raise
 
     def init_db(self):
@@ -221,7 +235,7 @@ class TradingBot:
                 cluster_levels[rounded_price] += amount
             
             sorted_clusters = sorted(cluster_levels.items(), key=lambda x: x[1], reverse=True)
-            return sorted_clusters[:5]  # Возвращаем топ-5 кластеров
+            return sorted_clusters[:5]
             
         except Exception as e:
             logger.error(f"Ошибка анализа стакана {symbol}: {e}")
@@ -359,11 +373,16 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Ошибка обработки WebSocket: {e}")
 
-    def ws_message_handler(self, message):
-        """Функция обратного вызова для сообщений WebSocket"""
+    def _ws_message_handler(self, message):
         try:
-            loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(self.message_queue.put(message), loop)
+            if not hasattr(threading.current_thread(), '_loop'):
+                threading.current_thread()._loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(threading.current_thread()._loop)
+
+            asyncio.run_coroutine_threadsafe(
+                self.message_queue.put(message),
+                self.loop
+            )
         except Exception as e:
             logger.error(f"Ошибка в обработчике сообщений: {e}")
 
@@ -376,7 +395,11 @@ class TradingBot:
 
                 message = await self.message_queue.get()
                 await self.handle_message(message)
+                self.message_queue.task_done()
 
+            except asyncio.CancelledError:
+                logger.info("WebSocket listener остановлен")
+                break
             except WebSocketError as e:
                 logger.error(f"WebSocket error: {e}")
                 await asyncio.sleep(5)
@@ -504,8 +527,8 @@ class TradingBot:
         logger.info("Завершение работы...")
         try:
             for symbol in list(self.open_positions.keys()):
-                await self.close_position(symbol)
-            if hasattr(self, 'ws') and self.ws.is_connected():
+                await self.close_position(sym)
+            if self.ws_connected and self.ws.is_connected():
                 await self.ws.close()
             if self.exchange:
                 await self.exchange.close()
@@ -513,12 +536,14 @@ class TradingBot:
             logger.error(f"Ошибка завершения: {e}")
 
 if __name__ == '__main__':
-    bot = TradingBot()
     try:
-        asyncio.run(bot.main_loop())
+        loop = asyncio.get_event_loop()
+        bot = TradingBot()
+        loop.run_until_complete(bot.main_loop())
     except KeyboardInterrupt:
-        logger.info("Завершение по сигналу пользователя")
-        asyncio.run(bot.shutdown())
+        logger.info("Получен сигнал завершения работы")
+        loop.run_until_complete(bot.shutdown())
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
-        asyncio.run(bot.shutdown())
+        logger.critical(f"Критическая ошибка: {e}")
+    finally:
+        loop.close()
