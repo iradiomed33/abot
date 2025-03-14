@@ -564,7 +564,7 @@ def fetch_symbols():
     symbols = []
     try:
         if WHITELIST:
-            symbols = [s.strip() for s in WHITELIST.split(',') if s.strip()]
+            symbols = [s.strip() for s in WHITELIST.split(',') if isinstance(s.strip(), str) and s.strip()]
         else:
             response = requests.get("https://api.bybit.com/v5/market/instruments-info?category=linear")
             data = response.json()
@@ -579,6 +579,10 @@ def fetch_symbols():
 
         logger.info(f"Список торговых пар: {symbols}")
         return symbols
+
+    except Exception as e:
+        logger.critical(f"Ошибка получения символов: {e}")
+        return []
 
     except Exception as e:
         logger.critical(f"Ошибка получения символов: {e}")
