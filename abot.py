@@ -28,7 +28,6 @@ file_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
-# Загрузка настроек из окружения
 API_KEY = os.getenv('API_KEY')
 API_SECRET = os.getenv('API_SECRET')
 if not API_KEY or not API_SECRET:
@@ -223,6 +222,8 @@ class TradingBot:
             asks = orderbook['asks']
             
             total_volume = sum([amt for _, amt in bids + asks])
+            logger.debug(f"Общий объем {symbol}: {total_volume:.2f}")
+            
             if total_volume < MIN_VOLUME * 0.1:
                 logger.warning(f"Слишком низкий объем для {symbol} ({total_volume:.2f} < {MIN_VOLUME*0.1:.2f})")
                 return []
@@ -245,25 +246,63 @@ class TradingBot:
         return data['close'].rolling(window=period).mean()
 
     def calculate_adx(self, data, period=14):
-        high, low, close = data['high'], data['low'], data['close']
-        tr = np.maximum(high - low, np.abs(high - close.shift()), np.abs(low - close.shift()))
-        atr = tr.rolling(window=period).mean().fillna(0)
-        plus_dm = np.where(high - high.shift() > low.shift() - low, high - high.shift(), 0)
-        minus_dm = np.where(low.shift() - low > high - high.shift(), low.shift() - low, 0)
-        plus_di = 100 * (pd.Series(plus_dm)).rolling(window=period).mean().fillna(0) / atr
-        minus_di = 100 * (pd.Series(minus_dm)).rolling(window=period).mean().fillna(0) / atr
-        dx = (np.abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
-        return dx.rolling(window=period).mean().fillna(0)
+        if len(data) < 2 * period:
+            logger.warning(f"Недостаточно данных для ADX. Требуется минимум {2 * period} свечей")
+            return pd.Series([0] * len(data), index=data.index)
+        
+        high = data['high']
+        low = data['low']
+        close = data['close']
+        
+        # Расчет True Range (TR)
+        tr = pd.concat([
+            high - low,
+            abs(high - close.shift(1)),
+            abs(low - close.shift(1))
+        ], axis=1).max(axis=1)
+        
+        # Расчет Average True Range (ATR)
+        atr = tr.rolling(window=period, min_periods=1).mean()
+        
+        # Расчет направленных движений (+DM и -DM)
+        plus_dm = (high - high.shift(1)).where(
+            (high.diff(1) > (low.shift(1) - low)) & 
+            (high.diff(1) > 0), 0
+        )
+        minus_dm = (low.shift(1) - low).where(
+            (low.shift(1) - low > high.diff(1)) & 
+            (low.shift(1) - low > 0), 0
+        )
+        
+        # Сглаживание DM
+        plus_di = 100 * (plus_dm.rolling(window=period).sum() / atr)
+        minus_di = 100 * (minus_dm.rolling(window=period).sum() / atr)
+        
+        # Расчет DX
+        denominator = plus_di + minus_di
+        dx = np.where(denominator != 0, (abs(plus_di - minus_di) / denominator * 100, 0))
+        
+        # Расчет ADX
+        adx = dx.rolling(window=period).mean().fillna(0)
+        
+        return adx
 
     def calculate_di(self, data, period=14):
-        high, low, close = data['high'], data['low'], data['close']
-        tr = np.maximum(high - low, np.abs(high - close.shift()), np.abs(low - close.shift()))
-        atr = tr.rolling(window=period).mean()
-        plus_dm = np.where(high - high.shift() > low.shift() - low, high - high.shift(), 0)
-        minus_dm = np.where(low.shift() - low > high - high.shift(), low.shift() - low, 0)
-        plus_di = 100 * (pd.Series(plus_dm)).rolling(window=period).mean() / atr
-        minus_di = 100 * (pd.Series(minus_dm)).rolling(window=period).mean() / atr
-        return plus_di.iloc[-1], minus_di.iloc[-1]
+        try:
+            adx = self.calculate_adx(data, period)
+            plus_di = 100 * (data['high'].diff().rolling(window=period).sum() /
+                       self.calculate_atr(data, period))
+            minus_di = 100 * (data['low'].diff(-1).abs().rolling(window=period).sum() /
+                        self.calculate_atr(data, period))
+            
+            plus_di = plus_di.replace([np.inf, -np.inf], 0)
+            minus_di = minus_di.replace([np.inf, -np.inf], 0)
+            
+            return plus_di.iloc[-1], minus_di.iloc[-1]
+        
+        except Exception as e:
+            logger.error(f"Ошибка расчета DI: {str(e)}")
+            return 0, 0
 
     def calculate_atr(self, data, period=ATR_PERIOD):
         tr = pd.concat([
@@ -281,6 +320,15 @@ class TradingBot:
             last_sma = sma.iloc[-1]
             last_adx = adx.iloc[-1]
             plus_di, minus_di = self.calculate_di(df)
+
+            logger.debug(
+                f"Индикаторы {df['symbol'].iloc[-1]}:\n"
+                f"Цена: {current_price:.4f}\n"
+                f"SMA: {last_sma:.4f}\n"
+                f"ADX: {last_adx:.1f}\n"
+                f"+DI: {plus_di:.1f}\n"
+                f"-DI: {minus_di:.1f}"
+            )
 
             if last_adx > ADX_THRESHOLD:
                 if current_price > last_sma and plus_di > minus_di:
@@ -313,6 +361,9 @@ class TradingBot:
                 )
                 logger.info(f"Ордер {side} {symbol} размещен! ID: {order['result']['orderId']}")
                 return adjusted_qty
+            except ccxt.InvalidOrder as e:
+                logger.error(f"Некорректные параметры ордера: {e}")
+                return False
             except Exception as e:
                 logger.error(f"Ошибка размещения ордера {symbol}: {e}")
                 return False
@@ -337,8 +388,8 @@ class TradingBot:
                 if self.initial_balance is None:
                     self.initial_balance = current_balance
                     continue
-                drawdown = (current_balance - self.initial_balance) / self.initial_balance
-                if drawdown < MAX_DRAWDOWN:
+                drawdown = (self.initial_balance - current_balance) / self.initial_balance
+                if drawdown >= abs(MAX_DRAWDOWN):
                     logger.critical(f"Просадка {drawdown:.2%}! Закрытие позиций...")
                     for sym in list(self.open_positions.keys()):
                         await self.close_position(sym)
@@ -369,6 +420,7 @@ class TradingBot:
                 
                 async with self.position_lock:
                     self.last_candle_ts[symbol] = candle_time
+                    logger.debug(f"Обновлен last_candle_ts для {symbol}: {candle_time}")
 
         except Exception as e:
             logger.error(f"Ошибка обработки WebSocket: {e}")
@@ -428,23 +480,31 @@ class TradingBot:
 
     async def process_candle(self, symbol):
         try:
+            logger.debug(f"Обработка {symbol} начата")
             await self.api_limiter.wait()
             df = await self.fetch_candles(symbol)
             if df is None or len(df) < SMA_PERIOD:
+                logger.warning(f"Недостаточно данных для {symbol}")
                 return
 
             last_ts = df['timestamp'].iloc[-1]
             if symbol in self.last_candle_ts and self.last_candle_ts[symbol] == last_ts:
+                logger.debug(f"Нет новых данных для {symbol}")
                 return
             self.last_candle_ts[symbol] = last_ts
 
             trend = self.determine_trend(df)
+            logger.debug(f"Тренд {symbol}: {trend}")
+            
             if trend == "flat":
+                logger.debug(f"Пропуск {symbol} - плоский тренд")
                 return
 
             orderbook_clusters = self.get_orderbook_clusters(symbol)
+            logger.debug(f"Кластеры стакана {symbol}: {orderbook_clusters}")
+            
             if not orderbook_clusters:
-                logger.warning(f"Пустой стакан для {symbol}, пропускаем")
+                logger.warning(f"Пустой стакан для {symbol}")
                 return
 
             atr_series = self.calculate_atr(df)
@@ -455,16 +515,25 @@ class TradingBot:
             order_usdt = usdt_balance * ORDER_PERCENTAGE
 
             best_support, best_resistance = self.get_historical_levels(df)
+            logger.debug(f"Исторические уровни {symbol}: Support={best_support:.4f}, Resistance={best_resistance:.4f}")
+            
             key_level = self.find_matching_level(
                 best_support if trend == "uptrend" else best_resistance,
                 orderbook_clusters
             )
+            logger.debug(f"Ключевой уровень {symbol}: {key_level}")
 
-            if key_level is None or abs(current_price - key_level) / key_level > 0.005:
+            if key_level is None or abs(current_price - key_level)/key_level > 0.015:
+                logger.debug(f"Нет подходящего уровня для {symbol}")
                 return
 
             raw_qty = order_usdt / key_level
-            placed_qty = await self.execute_order(symbol, key_level, "Buy" if trend == "uptrend" else "Sell", raw_qty)
+            placed_qty = await self.execute_order(
+                symbol, 
+                key_level, 
+                "Buy" if trend == "uptrend" else "Sell", 
+                raw_qty
+            )
             
             if placed_qty:
                 tp, sl = self.calculate_tp_sl(key_level, trend, atr_series.iloc[-1])
@@ -479,7 +548,7 @@ class TradingBot:
                 self.log_trade(symbol, "initial", key_level, placed_qty, "Buy" if trend == "uptrend" else "Sell", 0, tp, sl)
 
         except Exception as e:
-            logger.error(f"Ошибка обработки свечи {symbol}: {e}")
+            logger.error(f"Ошибка обработки свечи {symbol}: {e}", exc_info=True)
 
     def get_historical_levels(self, df, period=50):
         recent_data = df[-period:]
@@ -514,9 +583,13 @@ class TradingBot:
             ]
 
             while True:
-                for symbol in self.symbols:
-                    await self.process_candle(symbol)
-                await asyncio.sleep(int(TIMEFRAME))
+                try:
+                    for symbol in self.symbols:
+                        if symbol in self.last_candle_ts:
+                            await self.process_candle(symbol)
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    logger.error(f"Ошибка в цикле обработки: {e}")
 
         except Exception as e:
             logger.error(f"Ошибка в основном цикле: {e}")
@@ -527,7 +600,7 @@ class TradingBot:
         logger.info("Завершение работы...")
         try:
             for symbol in list(self.open_positions.keys()):
-                await self.close_position(sym)
+                await self.close_position(symbol)
             if self.ws_connected and self.ws.is_connected():
                 await self.ws.close()
             if self.exchange:
@@ -537,13 +610,14 @@ class TradingBot:
 
 if __name__ == '__main__':
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         bot = TradingBot()
         loop.run_until_complete(bot.main_loop())
     except KeyboardInterrupt:
         logger.info("Получен сигнал завершения работы")
         loop.run_until_complete(bot.shutdown())
     except Exception as e:
-        logger.critical(f"Критическая ошибка: {e}")
+        logger.critical(f"Критическая ошибка: {e}", exc_info=True)
     finally:
         loop.close()
