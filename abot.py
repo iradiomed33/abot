@@ -245,7 +245,7 @@ class TradingBot:
     def calculate_sma(self, data, period=SMA_PERIOD):
         return data['close'].rolling(window=period).mean()
 
-    def calculate_adx(data, period=14):
+    def calculate_adx(self, data, period=14):
            high, low, close = data['high'], data['low'], data['close']
            tr = np.maximum(high - low, np.abs(high - close.shift()), np.abs(low - close.shift()))
            atr = tr.rolling(window=period).mean()
@@ -277,6 +277,15 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Ошибка расчета DI: {str(e)}")
             return 0, 0
+            
+    def calculate_rsi(self, data, period=14):
+           delta = data['close'].diff()
+           gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+           loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+           rs = gain / loss
+           rsi = 100 - (100 / (1 + rs))
+           return rsi
+            
 
     def calculate_atr(self, data, period=ATR_PERIOD):
         tr = pd.concat([
@@ -286,20 +295,20 @@ class TradingBot:
         ], axis=1).max(axis=1)
         return tr.rolling(window=period).mean()
 
-    def determine_trend(df):
+    def determine_trend(self, df):
            try:
                  if 'symbol' not in df.columns or df['symbol'].empty:
                      logger.error(f"DataFrame не содержит столбца 'symbol' или он пуст")
                      return "flat"
             
-                 sma = calculate_sma(df, period=SMA_PERIOD)
-                 adx = calculate_adx(df, period=14)
-                 rsi = calculate_rsi(df, period=14)
+                 sma = self.calculate_sma(df, period=SMA_PERIOD)
+                 adx = self.calculate_adx(df, period=14)
+                 rsi = self.calculate_rsi(df, period=14)
                  current_price = df['close'].iloc[-1]
                  last_sma = sma.iloc[-1]
                  last_adx = adx.iloc[-1]
                  last_rsi = rsi.iloc[-1]
-                 plus_di, minus_di = calculate_di(df, period=14)
+                 plus_di, minus_di = self.calculate_di(df, period=14)
 
                  logger.info(f"[{df['symbol'].iloc[0]}] Индикаторы: SMA={last_sma:.2f}, ADX={last_adx:.2f}, RSI={last_rsi:.2f}, +DI={plus_di:.2f}, -DI={minus_di:.2f}, Цена={current_price:.2f}")
 
