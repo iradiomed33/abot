@@ -286,33 +286,44 @@ class TradingBot:
         ], axis=1).max(axis=1)
         return tr.rolling(window=period).mean()
 
-    def determine_trend(self, df):
-        try:
-            sma = self.calculate_sma(df)
-            adx = self.calculate_adx(df)
-            current_price = df['close'].iloc[-1]
-            last_sma = sma.iloc[-1]
-            last_adx = adx.iloc[-1]
-            plus_di, minus_di = self.calculate_di(df)
+    def determine_trend(df):
+           try:
+                 if 'symbol' not in df.columns or df['symbol'].empty:
+                     logger.error(f"DataFrame не содержит столбца 'symbol' или он пуст")
+                     return "flat"
+            
+                 sma = calculate_sma(df, period=SMA_PERIOD)
+                 adx = calculate_adx(df, period=14)
+                 rsi = calculate_rsi(df, period=14)
+                 current_price = df['close'].iloc[-1]
+                 last_sma = sma.iloc[-1]
+                 last_adx = adx.iloc[-1]
+                 last_rsi = rsi.iloc[-1]
+                 plus_di, minus_di = calculate_di(df, period=14)
 
-            logger.debug(
-                f"Индикаторы {df['symbol'].iloc[-1]}:\n"
-                f"Цена: {current_price:.4f}\n"
-                f"SMA: {last_sma:.4f}\n"
-                f"ADX: {last_adx:.1f}\n"
-                f"+DI: {plus_di:.1f}\n"
-                f"-DI: {minus_di:.1f}"
-            )
+                 logger.info(f"[{df['symbol'].iloc[0]}] Индикаторы: SMA={last_sma:.2f}, ADX={last_adx:.2f}, RSI={last_rsi:.2f}, +DI={plus_di:.2f}, -DI={minus_di:.2f}, Цена={current_price:.2f}")
 
-            if last_adx > ADX_THRESHOLD:
-                if current_price > last_sma and plus_di > minus_di:
-                    return "uptrend"
-                elif current_price < last_sma and minus_di > plus_di:
-                    return "downtrend"
-            return "flat"
-        except Exception as e:
-            logger.error(f"Ошибка определения тренда: {e}")
-            return "flat"
+                 if sma.isnull().any() or (sma == 0).any():
+                       logger.error(f"Недостаточно данных для SMA ({len(df)} < {SMA_PERIOD})")
+                       return "flat"
+
+                 if last_adx > ADX_THRESHOLD:
+                    if current_price > last_sma and last_rsi > 55 and plus_di > minus_di:
+                        trend = "uptrend"
+                    elif current_price < last_sma and last_rsi < 45 and minus_di > plus_di:
+                        trend = "downtrend"
+                    else:
+                        trend = "flat"
+                 else:
+                    trend = "flat"
+
+                 logger.info(f"Определен тренд: {trend}")
+                 return trend
+
+           except Exception as e:
+                 logger.error(f"Ошибка определения тренда: {e}")
+                 return "flat"
+
 
     async def execute_order(self, symbol, price, side, qty, order_type="Limit"):
         async with self.position_lock:
