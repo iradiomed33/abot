@@ -245,47 +245,21 @@ class TradingBot:
     def calculate_sma(self, data, period=SMA_PERIOD):
         return data['close'].rolling(window=period).mean()
 
-    def calculate_adx(self, data, period=14):
-        if len(data) < 2 * period:
-            logger.warning(f"Недостаточно данных для ADX. Требуется минимум {2 * period} свечей")
-            return pd.Series([0] * len(data), index=data.index)
-        
-        high = data['high']
-        low = data['low']
-        close = data['close']
-        
-        # Расчет True Range (TR)
-        tr = pd.concat([
-            high - low,
-            abs(high - close.shift(1)),
-            abs(low - close.shift(1))
-        ], axis=1).max(axis=1)
-        
-        # Расчет Average True Range (ATR)
-        atr = tr.rolling(window=period, min_periods=1).mean()
-        
-        # Расчет направленных движений (+DM и -DM)
-        plus_dm = (high - high.shift(1)).where(
-            (high.diff(1) > (low.shift(1) - low)) & 
-            (high.diff(1) > 0), 0
-        )
-        minus_dm = (low.shift(1) - low).where(
-            (low.shift(1) - low > high.diff(1)) & 
-            (low.shift(1) - low > 0), 0
-        )
-        
-        # Сглаживание DM
-        plus_di = 100 * (plus_dm.rolling(window=period).sum() / atr)
-        minus_di = 100 * (minus_dm.rolling(window=period).sum() / atr)
-        
-        # Расчет DX
-        denominator = plus_di + minus_di
-        dx = np.where(denominator != 0, (abs(plus_di - minus_di) / denominator * 100, 0))
-        
-        # Расчет ADX
-        adx = dx.rolling(window=period).mean().fillna(0)
-        
-        return adx
+    def calculate_adx(data, period=14):
+           high, low, close = data['high'], data['low'], data['close']
+           tr = np.maximum(high - low, np.abs(high - close.shift()), np.abs(low - close.shift()))
+           atr = tr.rolling(window=period).mean()
+           plus_dm = np.where(high - high.shift() > low.shift() - low, high - high.shift(), 0)
+           minus_dm = np.where(low.shift() - low > high - high.shift(), low.shift() - low, 0)
+           plus_di = 100 * (pd.Series(plus_dm).rolling(window=period).mean() / atr)
+           minus_di = 100 * (pd.Series(minus_dm).rolling(window=period).mean() / atr)
+           dx = (np.abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+           adx = dx.rolling(window=period).mean()
+
+    # Исключение начальных NaN значений из расчетов
+           adx = adx.dropna()
+
+           return adx
 
     def calculate_di(self, data, period=14):
         try:
